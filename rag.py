@@ -1,76 +1,77 @@
 """
-rag.py — Retrieval module (Owner: Rameen)
+rag.py — Data & RAG Engine (Owner: Rameen)
 
 CONTRACT (do not change without telling the whole team):
     retrieve_info(query: str) -> {
-        "chunks": [str, ...],       # relevant text chunks to feed the LLM
-        "sources": [(name, url), ...]  # e.g. [("MedlinePlus", "https://medlineplus.gov/druginformation.html")]
+        "chunks": [str, ...],      # the actual retrieved text pieces
+        "sources": [str, ...],     # matching source reference per chunk
     }
 
-CURRENT STATE: this is a working stub using fuzzy name-matching over the local CSV,
-so the rest of the team can build against real output shapes today.
-
-TODO (Rameen):
-    1. Replace `_fuzzy_lookup` with real chunking + embeddings + ChromaDB vector search.
-    2. Pull richer data from OpenFDA / DailyMed instead of relying only on medicines.csv.
-    3. Build the ChromaDB snapshot ONCE (offline) and load it here — never build live.
+CURRENT STATE: loads the pre-built ChromaDB store from ./chroma_db
+(built once by build_index.py — this file NEVER rebuilds the index itself,
+it only reads it). If a query matches nothing meaningful, it returns empty
+lists — Afsheen's safety.py / the fallback prompt handles what happens next,
+not this file.
 """
 
-import csv
 import os
-from difflib import get_close_matches
+import chromadb
 
-CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "medicines.csv")
+BASE_DIR = os.path.dirname(__file__)
+CHROMA_PATH = os.path.join(BASE_DIR, "chroma_db")
+COLLECTION_NAME = "medicines"
 
-SOURCES = [
-    ("MedlinePlus", "https://medlineplus.gov/druginformation.html"),
-    ("DailyMed / FDA", "https://www.dailymed.nlm.nih.gov/dailymed/"),
-]
+# how many chunks to pull per query — tune this if answers feel thin or noisy
+N_RESULTS = 4
+# below this distance, a match is too weak to trust — tune based on real testing
+MAX_DISTANCE = 1.5
 
-
-def _load_medicines():
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
-_MEDICINES = _load_medicines()
-_NAMES = [m["medicine_name"] for m in _MEDICINES]
+_client = None
+_collection = None
 
 
-def _fuzzy_lookup(query: str):
-    """Very simple name match — placeholder for real vector search."""
-    matches = get_close_matches(query.lower(), [n.lower() for n in _NAMES], n=1, cutoff=0.4)
-    if not matches:
-        return None
-    for m in _MEDICINES:
-        if m["medicine_name"].lower() == matches[0]:
-            return m
-    return None
+def _get_collection():
+    global _client, _collection
+    if _collection is None:
+        if not os.path.exists(CHROMA_PATH):
+            raise RuntimeError(
+                "No chroma_db folder found — run build_index.py first to create it."
+            )
+        _client = chromadb.PersistentClient(path=CHROMA_PATH)
+        _collection = _client.get_collection(name=COLLECTION_NAME)
+    return _collection
 
 
 def retrieve_info(query: str) -> dict:
     """
-    Main entry point. Given a free-text query (usually a medicine name,
-    sometimes a natural-language question), return grounded chunks + sources.
-
-    If nothing matches, return an empty chunks list — the LLM prompt
-    (see safety.py SYSTEM_PROMPT) is responsible for turning that into
-    a "Record Not Found" response. Do NOT invent a chunk here.
+    Retrieve the most relevant chunks for a user query.
+    Returns {"chunks": [], "sources": []} if nothing good enough is found —
+    this is what feeds safety.py's "Record Not Found" fallback logic.
     """
-    record = _fuzzy_lookup(query)
-    if record is None:
+    if not query or not query.strip():
         return {"chunks": [], "sources": []}
 
-    chunk = (
-        f"{record['medicine_name']} is a {record['drug_type']}. "
-        f"Main use: {record['main_use']}. "
-        f"Common forms: {record['common_forms']}. "
-        f"Safety note: {record['safety_note']}"
-    )
-    return {"chunks": [chunk], "sources": SOURCES}
+    collection = _get_collection()
+    results = collection.query(query_texts=[query], n_results=N_RESULTS)
+
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    distances = results.get("distances", [[]])[0]
+
+    chunks, sources = [], []
+    for doc, meta, dist in zip(documents, metadatas, distances):
+        if dist is not None and dist > MAX_DISTANCE:
+            continue  # too weak a match — don't hand it to the LLM as "real" info
+        chunks.append(doc)
+        sources.append(meta.get("source", "MedlinePlus / DailyMed / FDA"))
+
+    return {"chunks": chunks, "sources": sources}
 
 
 if __name__ == "__main__":
-    # quick manual sanity check — run `python rag.py` to test
-    for test_query in ["Paracetamol", "ibuprofen", "Zorbaxamine"]:
-        print(test_query, "->", retrieve_info(test_query))
+    # quick manual test — run this after build_index.py to sanity check
+    for test_query in ["What is Paracetamol used for?", "Ibuprofen side effects", "Amoxicillin allergy warning"]:
+        result = retrieve_info(test_query)
+        print("\nQuery:", test_query)
+        for c, s in zip(result["chunks"], result["sources"]):
+            print(" -", c, f"[{s}]")
