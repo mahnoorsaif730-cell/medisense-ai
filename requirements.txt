@@ -1,0 +1,7 @@
+   streamlit
+   pytesseract
+   pillow
+   chromadb
+   openai
+   anthropic
+   python-dotenv
